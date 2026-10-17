@@ -16,10 +16,10 @@ jobs:
           channel: stable
       - name: Build APK
         run: |
-          cd malfati
+          cd mlafate
           flutter pub get
           flutter build apk --release
       - uses: actions/upload-artifact@v4
         with:
           name: file-organizer-apk
-          path: malfati/build/app/outputs/flutter-apk/app-release.apk
+          path: mlafate/build/app/outputs/flutter-apk/app-release.apk
