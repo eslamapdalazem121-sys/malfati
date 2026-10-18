@@ -34,6 +34,7 @@ jobs:
             path: ^1.9.0
             shared_preferences: ^2.3.0
             workmanager: any
+            open_filex: any
 
           flutter:
             uses-material-design: true
@@ -42,6 +43,7 @@ jobs:
           import 'dart:io';
           import 'package:flutter/material.dart';
           import 'package:google_fonts/google_fonts.dart';
+          import 'package:open_filex/open_filex.dart';
           import 'package:path/path.dart' as p;
           import 'package:permission_handler/permission_handler.dart';
           import 'package:shared_preferences/shared_preferences.dart';
@@ -228,7 +230,7 @@ jobs:
             @override
             void initState() {
               super.initState();
-              refresh();
+              ensurePermission().then((_) => refresh());
               loadAuto();
             }
 
@@ -318,7 +320,7 @@ jobs:
                       padding: const EdgeInsets.fromLTRB(20, 24, 20, 12),
                       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                         const Text('ملفاتي', style: TextStyle(fontSize: 34, fontWeight: FontWeight.w800)),
-                        Text('في $pending ملف مستني الترتيب', style: TextStyle(fontSize: 15, color: Colors.white.withAlpha(150))),
+                        Text('في $pending ملف مستني الترتيب  •  v3', style: TextStyle(fontSize: 15, color: Colors.white.withAlpha(150))),
                         const SizedBox(height: 22),
                         Block3D(
                           color: const Color(0xFF7C5CFF),
@@ -363,6 +365,7 @@ jobs:
                                 Block3D(
                                   color: c.color,
                                   depth: 7,
+                                  onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => CategoryPage(c))).then((_) => refresh()),
                                   child: Padding(
                                     padding: const EdgeInsets.all(14),
                                     child: Column(mainAxisAlignment: MainAxisAlignment.spaceBetween, crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -390,6 +393,127 @@ jobs:
               );
             }
           }
+
+          String fmtSize(int b) {
+            if (b < 1024) return '$b B';
+            if (b < 1048576) return '${(b / 1024).toStringAsFixed(0)} KB';
+            if (b < 1073741824) return '${(b / 1048576).toStringAsFixed(1)} MB';
+            return '${(b / 1073741824).toStringAsFixed(2)} GB';
+          }
+
+          /// شاشة قسم: بتعرض ملفات القسم وتفتح أي ملف بلمسة
+          class CategoryPage extends StatefulWidget {
+            final Cat cat;
+            const CategoryPage(this.cat, {super.key});
+            @override
+            State<CategoryPage> createState() => _CategoryPageState();
+          }
+
+          class _CategoryPageState extends State<CategoryPage> {
+            List<MapEntry<File, FileStat>>? items;
+
+            @override
+            void initState() {
+              super.initState();
+              load();
+            }
+
+            Future<void> load() async {
+              final d = Directory('$outDir/${widget.cat.folder}');
+              final list = <MapEntry<File, FileStat>>[];
+              if (d.existsSync()) {
+                await for (final e in d.list(followLinks: false)) {
+                  if (e is File) list.add(MapEntry(e, e.statSync()));
+                }
+              }
+              list.sort((a, b) => b.value.modified.compareTo(a.value.modified));
+              if (mounted) setState(() => items = list);
+            }
+
+            Future<void> openFile(File f) async {
+              final r = await OpenFilex.open(f.path);
+              if (r.type != ResultType.done && mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('مفيش تطبيق على الموبايل يفتح الملف ده')));
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final c = widget.cat;
+              final list = items;
+              return Scaffold(
+                body: Container(
+                  decoration: const BoxDecoration(
+                    gradient: LinearGradient(begin: Alignment.topCenter, end: Alignment.bottomCenter, colors: [Color(0xFF1B1840), Color(0xFF0E0C24)]),
+                  ),
+                  child: SafeArea(
+                    child: Column(children: [
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(8, 8, 20, 8),
+                        child: Row(children: [
+                          IconButton(icon: const Icon(Icons.arrow_forward_rounded), onPressed: () => Navigator.pop(context)),
+                          Icon(c.icon, color: c.color),
+                          const SizedBox(width: 10),
+                          Text(c.label, style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w800)),
+                          const Spacer(),
+                          Text('${list?.length ?? 0} ملف', style: TextStyle(color: Colors.white.withAlpha(150))),
+                        ]),
+                      ),
+                      Expanded(
+                        child: list == null
+                            ? const Center(child: CircularProgressIndicator())
+                            : list.isEmpty
+                                ? Center(child: Text('مفيش ملفات هنا لسه', style: TextStyle(color: Colors.white.withAlpha(150))))
+                                : c == Cat.images
+                                    ? GridView.builder(
+                                        padding: const EdgeInsets.all(12),
+                                        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 3, mainAxisSpacing: 8, crossAxisSpacing: 8),
+                                        itemCount: list.length,
+                                        itemBuilder: (_, i) => GestureDetector(
+                                          onTap: () => openFile(list[i].key),
+                                          child: ClipRRect(
+                                            borderRadius: BorderRadius.circular(14),
+                                            child: Image.file(list[i].key, fit: BoxFit.cover, cacheWidth: 300, errorBuilder: (_, __, ___) => Container(color: c.color.withAlpha(60), child: const Icon(Icons.broken_image_rounded))),
+                                          ),
+                                        ),
+                                      )
+                                    : ListView.builder(
+                                        padding: const EdgeInsets.fromLTRB(16, 4, 16, 20),
+                                        itemCount: list.length,
+                                        itemBuilder: (_, i) {
+                                          final f = list[i].key;
+                                          final st = list[i].value;
+                                          return Padding(
+                                            padding: const EdgeInsets.only(bottom: 14),
+                                            child: Block3D(
+                                              color: c.color,
+                                              depth: 4,
+                                              radius: 18,
+                                              onTap: () => openFile(f),
+                                              child: Padding(
+                                                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                                                child: Row(children: [
+                                                  Icon(c.icon, size: 26),
+                                                  const SizedBox(width: 12),
+                                                  Expanded(
+                                                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                                                      Text(p.basename(f.path), maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w800)),
+                                                      Text('${fmtSize(st.size)}  •  ${st.modified.year}/${st.modified.month}/${st.modified.day}', style: TextStyle(fontSize: 12, color: Colors.white.withAlpha(210))),
+                                                    ]),
+                                                  ),
+                                                ]),
+                                              ),
+                                            ),
+                                          );
+                                        },
+                                      ),
+                      ),
+                    ]),
+                  ),
+                ),
+              );
+            }
+          }
           MAIN_EOF
       - name: Create Android project
         run: flutter create --platforms=android --project-name file_organizer .
@@ -400,5 +524,5 @@ jobs:
       - run: flutter build apk --release
       - uses: actions/upload-artifact@v4
         with:
-          name: file-organizer-apk
+          name: file-organizer-v3-apk
           path: build/app/outputs/flutter-apk/app-release.apk
