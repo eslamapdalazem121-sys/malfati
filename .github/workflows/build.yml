@@ -183,12 +183,11 @@ jobs:
             Widget build(BuildContext context) {
               final r = BorderRadius.circular(widget.radius);
               return GestureDetector(
+                behavior: HitTestBehavior.opaque,
                 onTapDown: (_) => setState(() => down = true),
                 onTapCancel: () => setState(() => down = false),
-                onTapUp: (_) {
-                  setState(() => down = false);
-                  widget.onTap?.call();
-                },
+                onTapUp: (_) => setState(() => down = false),
+                onTap: widget.onTap,
                 child: AnimatedContainer(
                   duration: const Duration(milliseconds: 110),
                   transformAlignment: Alignment.center,
@@ -241,19 +240,32 @@ jobs:
               if (v && await Permission.manageExternalStorage.isGranted) organize();
             }
 
+            Future<void> openCat(Cat c) async {
+              try {
+                await Navigator.of(context).push(MaterialPageRoute(builder: (_) => CategoryPage(c)));
+                refresh();
+              } catch (e) {
+                toast('تعذر فتح القسم: $e');
+              }
+            }
+
             Future<void> setAuto(bool v) async {
               if (v && !await ensurePermission()) {
                 toast('لازم توافق على صلاحية الوصول لكل الملفات');
                 return;
               }
-              final sp = await SharedPreferences.getInstance();
-              await sp.setBool('auto', v);
-              if (v) {
-                await Workmanager().registerPeriodicTask('auto-organize', 'autoOrganize', frequency: const Duration(minutes: 15));
-              } else {
-                await Workmanager().cancelByUniqueName('auto-organize');
-              }
               setState(() => auto = v);
+              try {
+                final sp = await SharedPreferences.getInstance();
+                await sp.setBool('auto', v);
+                if (v) {
+                  await Workmanager().registerPeriodicTask('auto-organize', 'autoOrganize', frequency: const Duration(minutes: 15));
+                } else {
+                  await Workmanager().cancelByUniqueName('auto-organize');
+                }
+              } catch (e) {
+                toast('الترتيب في الخلفية مش متاح: $e');
+              }
               if (v) organize();
             }
 
@@ -320,7 +332,7 @@ jobs:
                       padding: const EdgeInsets.fromLTRB(20, 24, 20, 12),
                       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                         const Text('ملفاتي', style: TextStyle(fontSize: 34, fontWeight: FontWeight.w800)),
-                        Text('في $pending ملف مستني الترتيب  •  v3', style: TextStyle(fontSize: 15, color: Colors.white.withAlpha(150))),
+                        Text('في $pending ملف مستني الترتيب  •  v4', style: TextStyle(fontSize: 15, color: Colors.white.withAlpha(150))),
                         const SizedBox(height: 22),
                         Block3D(
                           color: const Color(0xFF7C5CFF),
@@ -365,7 +377,7 @@ jobs:
                                 Block3D(
                                   color: c.color,
                                   depth: 7,
-                                  onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => CategoryPage(c))).then((_) => refresh()),
+                                  onTap: () => openCat(c),
                                   child: Padding(
                                     padding: const EdgeInsets.all(14),
                                     child: Column(mainAxisAlignment: MainAxisAlignment.spaceBetween, crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -524,5 +536,5 @@ jobs:
       - run: flutter build apk --release
       - uses: actions/upload-artifact@v4
         with:
-          name: file-organizer-v3-apk
+          name: file-organizer-v4-apk
           path: build/app/outputs/flutter-apk/app-release.apk
