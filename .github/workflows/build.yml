@@ -1,5 +1,5 @@
-n APK
-oame: Buildn:
+name: Build APK
+on:
   push:
   workflow_dispatch:
 jobs:
