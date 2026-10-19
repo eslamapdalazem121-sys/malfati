@@ -1,10 +1,22 @@
-name: Build APK 
+name: Build APK
 on:
+  push:
+  workflow_dispatch:
   push:
   workflow_dispatch:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: stable
+            org: com.example
+            label: ملفاتي
+          - flavor: beta
+            org: com.malfati.beta
+            label: ملفاتي تجريبي
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -32,7 +44,6 @@ jobs:
             google_fonts: ^6.2.1
             permission_handler: ^11.3.1
             path: ^1.9.0
-            shared_preferences: ^2.3.0
             workmanager: any
             open_filex: any
 
@@ -46,12 +57,22 @@ jobs:
           import 'package:open_filex/open_filex.dart';
           import 'package:path/path.dart' as p;
           import 'package:permission_handler/permission_handler.dart';
-          import 'package:shared_preferences/shared_preferences.dart';
           import 'package:workmanager/workmanager.dart';
 
           const root = '/storage/emulated/0';
           const outDir = '$root/Organized';
-          const sources = ['$root/Download', '$root/Documents', '$root/Pictures', '$root/Movies', '$root/Music'];
+          const flavor = String.fromEnvironment('FLAVOR', defaultValue: 'stable');
+          const sources = [
+            '$root/DCIM',
+            '$root/Pictures',
+            '$root/Movies',
+            '$root/Music',
+            '$root/Documents',
+            '$root/Download',
+            '$root/Android/media/com.whatsapp/WhatsApp/Media',
+            '$root/WhatsApp/Media',
+            '$root/Telegram',
+          ];
 
           enum Cat {
             images('صور', 'Images', Icons.photo_rounded, Color(0xFFFF6B9A), {'jpg', 'jpeg', 'png', 'webp', 'gif', 'heic', 'bmp'}),
@@ -79,9 +100,11 @@ jobs:
             return h.withLightness((h.lightness + d).clamp(0.0, 1.0)).toColor();
           }
 
+          bool hiddenPath(String path) => p.split(path).any((s) => s.startsWith('.'));
+
           bool shouldSkip(File f) {
             final n = p.basename(f.path).toLowerCase();
-            if (n.startsWith('.')) return true;
+            if (hiddenPath(f.path)) return true;
             const partial = {'crdownload', 'part', 'tmp', 'temp', 'download'};
             if (partial.contains(p.extension(n).replaceFirst('.', ''))) return true;
             try {
@@ -93,7 +116,38 @@ jobs:
             return false;
           }
 
-          Future<List<File>> collectFiles() async {
+          // سجل النسخ: كل سطر = مسار الأصل ، الحجم ، تاريخ التعديل ، مسار النسخة
+          File get indexFile => File('$outDir/.index.tsv');
+
+          String keyOf(File f, FileStat st) => '${f.path}\t${st.size}\t${st.modified.millisecondsSinceEpoch}';
+
+          Set<String> loadIndex(int part, {bool keyOnly = false}) {
+            final out = <String>{};
+            if (!indexFile.existsSync()) return out;
+            for (final l in indexFile.readAsLinesSync()) {
+              final parts = l.split('\t');
+              if (parts.length < 4) continue;
+              out.add(keyOnly ? '${parts[0]}\t${parts[1]}\t${parts[2]}' : parts[part]);
+            }
+            return out;
+          }
+
+          void flushIndex(List<String> lines) {
+            if (lines.isEmpty) return;
+            Directory(outDir).createSync(recursive: true);
+            indexFile.writeAsStringSync('${lines.join('\n')}\n', mode: FileMode.append);
+          }
+
+          void removeFromIndex(Set<String> dests) {
+            if (!indexFile.existsSync()) return;
+            final keep = indexFile.readAsLinesSync().where((l) {
+              final parts = l.split('\t');
+              return parts.length < 4 || !dests.contains(parts[3]);
+            }).toList();
+            indexFile.writeAsStringSync(keep.isEmpty ? '' : '${keep.join('\n')}\n');
+          }
+
+          Future<List<File>> collectFiles({bool onlyNew = true}) async {
             final files = <File>[];
             try {
               for (final e in Directory(root).listSync()) {
@@ -104,35 +158,103 @@ jobs:
               final d = Directory(s);
               if (!d.existsSync()) continue;
               try {
-                await for (final e in d.list(recursive: true, followLinks: false)) {
+                await for (final e in d.list(recursive: true, followLinks: false).handleError((_) {})) {
                   if (e is File) files.add(e);
                 }
               } catch (_) {}
             }
-            return files.where((f) => !shouldSkip(f)).toList();
+            final keys = onlyNew ? loadIndex(0, keyOnly: true) : <String>{};
+            return files.where((f) {
+              if (shouldSkip(f)) return false;
+              if (!onlyNew) return true;
+              try {
+                return !keys.contains(keyOf(f, f.statSync()));
+              } catch (_) {
+                return false;
+              }
+            }).toList();
           }
 
-          Future<List<List<String>>> moveAll() async {
-            final moves = <List<String>>[];
-            for (final f in await collectFiles()) {
-              final dir = Directory('$outDir/${catOf(f.path).folder}')..createSync(recursive: true);
-              var dest = p.join(dir.path, p.basename(f.path));
-              var i = 1;
-              while (File(dest).existsSync()) {
-                dest = p.join(dir.path, '${p.basenameWithoutExtension(f.path)} ($i)${p.extension(f.path)}');
-                i++;
-              }
+          /// بينسخ الملفات الجديدة بس إلى مجلد Organized، والأصل بيفضل مكانه
+          Future<List<List<String>>> copyAll({void Function(int done, int total)? onProgress}) async {
+            final files = await collectFiles();
+            final made = <List<String>>[];
+            final lines = <String>[];
+            var done = 0;
+            for (final f in files) {
               try {
-                try {
-                  f.renameSync(dest);
-                } on FileSystemException {
-                  f.copySync(dest);
-                  f.deleteSync();
+                final st = f.statSync();
+                final dir = Directory('$outDir/${catOf(f.path).folder}')..createSync(recursive: true);
+                var dest = p.join(dir.path, p.basename(f.path));
+                var i = 1;
+                while (File(dest).existsSync()) {
+                  dest = p.join(dir.path, '${p.basenameWithoutExtension(f.path)} ($i)${p.extension(f.path)}');
+                  i++;
                 }
-                moves.add([f.path, dest]);
+                await f.copy(dest);
+                try {
+                  File(dest).setLastModifiedSync(st.modified);
+                } catch (_) {}
+                lines.add('${keyOf(f, st)}\t$dest');
+                made.add([f.path, dest]);
               } catch (_) {}
+              done++;
+              if (onProgress != null && done % 20 == 0) onProgress(done, files.length);
+              if (lines.length >= 100) {
+                flushIndex(lines);
+                lines.clear();
+              }
             }
-            return moves;
+            flushIndex(lines);
+            if (onProgress != null) onProgress(files.length, files.length);
+            return made;
+          }
+
+          String restoreDir(Cat c) {
+            switch (c) {
+              case Cat.images:
+                return '$root/Pictures/Restored';
+              case Cat.videos:
+                return '$root/Movies/Restored';
+              case Cat.audio:
+                return '$root/Music/Restored';
+              case Cat.docs:
+                return '$root/Documents/Restored';
+              default:
+                return '$root/Download/Restored';
+            }
+          }
+
+          /// بيرجّع الملفات اللي اتنقلت (مش نسخ) من Organized لأماكن تانية يظهروا فيها للنظام
+          Future<int> restoreAll() async {
+            final copies = loadIndex(3);
+            var n = 0;
+            for (final c in Cat.values) {
+              final d = Directory('$outDir/${c.folder}');
+              if (!d.existsSync()) continue;
+              final target = Directory(restoreDir(c))..createSync(recursive: true);
+              for (final e in d.listSync()) {
+                if (e is File && !copies.contains(e.path)) {
+                  var dest = p.join(target.path, p.basename(e.path));
+                  var i = 1;
+                  while (File(dest).existsSync()) {
+                    dest = p.join(target.path, '${p.basenameWithoutExtension(e.path)} ($i)${p.extension(e.path)}');
+                    i++;
+                  }
+                  try {
+                    try {
+                      e.renameSync(dest);
+                    } on FileSystemException {
+                      e.copySync(dest);
+                      e.deleteSync();
+                    }
+                    n++;
+                  } catch (_) {}
+                  if (n % 50 == 0) await Future<void>.delayed(Duration.zero);
+                }
+              }
+            }
+            return n;
           }
 
           /// بيشتغل في الخلفية كل 15 دقيقة حتى والتطبيق مقفول
@@ -140,7 +262,7 @@ jobs:
           void callbackDispatcher() {
             Workmanager().executeTask((task, input) async {
               try {
-                if (await Permission.manageExternalStorage.isGranted) await moveAll();
+                if (await Permission.manageExternalStorage.isGranted) await copyAll();
               } catch (_) {}
               return true;
             });
@@ -224,6 +346,7 @@ jobs:
             int pending = 0;
             bool busy = false;
             bool auto = false;
+            String progress = '';
             List<List<String>> lastMoves = [];
 
             @override
@@ -234,39 +357,47 @@ jobs:
             }
 
             Future<void> loadAuto() async {
-              final sp = await SharedPreferences.getInstance();
-              final v = sp.getBool('auto') ?? false;
+              final granted = await Permission.manageExternalStorage.isGranted;
+              final v = granted && File('$outDir/.auto_enabled').existsSync();
               if (mounted) setState(() => auto = v);
-              if (v && await Permission.manageExternalStorage.isGranted) organize();
+              if (v) organize();
+            }
+
+            Future<void> setAuto(bool v) async {
+              try {
+                if (v && !await ensurePermission()) {
+                  toast('لازم توافق على صلاحية الوصول لكل الملفات');
+                  return;
+                }
+                final flag = File('$outDir/.auto_enabled');
+                if (v) {
+                  flag.createSync(recursive: true);
+                } else if (flag.existsSync()) {
+                  flag.deleteSync();
+                }
+                if (mounted) setState(() => auto = v);
+                try {
+                  if (v) {
+                    await Workmanager().registerPeriodicTask('auto-organize', 'autoOrganize', frequency: const Duration(minutes: 15));
+                  } else {
+                    await Workmanager().cancelByUniqueName('auto-organize');
+                  }
+                } catch (e) {
+                  toast('الترتيب في الخلفية مش متاح: $e');
+                }
+                if (v) organize();
+              } catch (e) {
+                toast('خطأ: $e');
+              }
             }
 
             Future<void> openCat(Cat c) async {
               try {
                 await Navigator.of(context).push(MaterialPageRoute(builder: (_) => CategoryPage(c)));
-                refresh();
               } catch (e) {
                 toast('تعذر فتح القسم: $e');
               }
-            }
-
-            Future<void> setAuto(bool v) async {
-              if (v && !await ensurePermission()) {
-                toast('لازم توافق على صلاحية الوصول لكل الملفات');
-                return;
-              }
-              setState(() => auto = v);
-              try {
-                final sp = await SharedPreferences.getInstance();
-                await sp.setBool('auto', v);
-                if (v) {
-                  await Workmanager().registerPeriodicTask('auto-organize', 'autoOrganize', frequency: const Duration(minutes: 15));
-                } else {
-                  await Workmanager().cancelByUniqueName('auto-organize');
-                }
-              } catch (e) {
-                toast('الترتيب في الخلفية مش متاح: $e');
-              }
-              if (v) organize();
+              refresh();
             }
 
             Future<bool> ensurePermission() async {
@@ -274,48 +405,85 @@ jobs:
               return await s.isGranted || (await s.request()).isGranted;
             }
 
-            Future<List<File>> collect() => collectFiles();
-
             Future<void> refresh() async {
               if (!await Permission.manageExternalStorage.isGranted) return;
-              final files = await collect();
+              final files = await collectFiles();
               final m = <Cat, int>{};
               for (final c in Cat.values) {
                 final d = Directory('$outDir/${c.folder}');
                 m[c] = d.existsSync() ? d.listSync().whereType<File>().length : 0;
               }
-              if (mounted) setState(() {
-                pending = files.length;
-                counts.addAll(m);
-              });
+              if (mounted) {
+                setState(() {
+                  pending = files.length;
+                  counts.addAll(m);
+                });
+              }
             }
 
             Future<void> organize() async {
+              if (busy) return;
               if (!await ensurePermission()) {
-                toast('محتاج صلاحية الوصول لكل الملفات عشان أرتبها');
+                toast('محتاج صلاحية الوصول لكل الملفات عشان أنسخها');
                 return;
               }
-              setState(() => busy = true);
-              final moves = await moveAll();
-              lastMoves = moves;
+              setState(() {
+                busy = true;
+                progress = '';
+              });
+              final made = await copyAll(onProgress: (d, t) {
+                if (mounted) setState(() => progress = '$d / $t');
+              });
+              lastMoves = made;
               await refresh();
               if (mounted) setState(() => busy = false);
-              toast('تم ترتيب ${moves.length} ملف');
+              toast('اتنسخ ${made.length} ملف، والأصل لسه مكانه');
+            }
+
+            Future<void> restore() async {
+              if (busy) return;
+              if (!await ensurePermission()) {
+                toast('محتاج صلاحية الوصول لكل الملفات');
+                return;
+              }
+              final ok = await showDialog<bool>(
+                context: context,
+                builder: (dc) => AlertDialog(
+                  title: const Text('استرجاع الملفات'),
+                  content: const Text(
+                      'هرجّع الملفات اللي اتنقلت قبل كده من مجلد Organized:\nالصور في Pictures/Restored\nالفيديو في Movies/Restored\nالصوتيات في Music/Restored\nالمستندات في Documents/Restored\nوالباقي في Download/Restored\n\nالنسخ الجديدة اللي الأصل بتاعها موجود مش هتتلمس.'),
+                  actions: [
+                    TextButton(onPressed: () => Navigator.pop(dc, false), child: const Text('إلغاء')),
+                    TextButton(onPressed: () => Navigator.pop(dc, true), child: const Text('رجّع')),
+                  ],
+                ),
+              );
+              if (ok != true) return;
+              setState(() {
+                busy = true;
+                progress = '';
+              });
+              final n = await restoreAll();
+              await refresh();
+              if (mounted) setState(() => busy = false);
+              toast('اتسترجع $n ملف');
             }
 
             Future<void> undo() async {
               setState(() => busy = true);
-              for (final m in lastMoves.reversed) {
+              final dests = <String>{};
+              for (final m in lastMoves) {
                 try {
-                  Directory(p.dirname(m[0])).createSync(recursive: true);
-                  File(m[1]).renameSync(m[0]);
+                  File(m[1]).deleteSync();
+                  dests.add(m[1]);
                 } catch (_) {}
               }
-              final n = lastMoves.length;
+              removeFromIndex(dests);
+              final n = dests.length;
               lastMoves = [];
               await refresh();
               if (mounted) setState(() => busy = false);
-              toast('رجّعت $n ملف لمكانه');
+              toast('اتمسح $n نسخة من آخر عملية');
             }
 
             void toast(String t) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(t)));
@@ -329,30 +497,52 @@ jobs:
                   ),
                   child: SafeArea(
                     child: Padding(
-                      padding: const EdgeInsets.fromLTRB(20, 24, 20, 12),
+                      padding: const EdgeInsets.fromLTRB(20, 20, 20, 8),
                       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                         const Text('ملفاتي', style: TextStyle(fontSize: 34, fontWeight: FontWeight.w800)),
-                        Text('في $pending ملف مستني الترتيب  •  v4', style: TextStyle(fontSize: 15, color: Colors.white.withAlpha(150))),
-                        const SizedBox(height: 22),
+                        Text('في $pending ملف مستني النسخ  •  v6${flavor == "beta" ? "  •  تجريبي" : ""}',
+                            style: TextStyle(fontSize: 15, color: Colors.white.withAlpha(150))),
+                        const SizedBox(height: 16),
                         Block3D(
                           color: const Color(0xFF7C5CFF),
                           depth: 10,
                           radius: 28,
                           onTap: busy ? null : organize,
                           child: Padding(
-                            padding: const EdgeInsets.symmetric(vertical: 22),
+                            padding: const EdgeInsets.symmetric(vertical: 20),
                             child: Center(
                               child: busy
-                                  ? const SizedBox(width: 28, height: 28, child: CircularProgressIndicator(strokeWidth: 3, color: Colors.white))
+                                  ? Row(mainAxisSize: MainAxisSize.min, children: [
+                                      const SizedBox(width: 26, height: 26, child: CircularProgressIndicator(strokeWidth: 3, color: Colors.white)),
+                                      const SizedBox(width: 12),
+                                      Text(progress.isEmpty ? 'جاري الشغل...' : 'جاري النسخ $progress', style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w800)),
+                                    ])
                                   : const Row(mainAxisSize: MainAxisSize.min, children: [
-                                      Icon(Icons.auto_awesome_rounded, size: 28),
+                                      Icon(Icons.auto_awesome_rounded, size: 26),
                                       SizedBox(width: 10),
-                                      Text('رتّب كل ملفاتي', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+                                      Text('انسخ ورتّب ملفاتي', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
                                     ]),
                             ),
                           ),
                         ),
-                        const SizedBox(height: 16),
+                        const SizedBox(height: 20),
+                        Block3D(
+                          color: const Color(0xFFFF9F45),
+                          depth: 5,
+                          radius: 20,
+                          onTap: busy ? null : restore,
+                          child: const Padding(
+                            padding: EdgeInsets.symmetric(vertical: 12),
+                            child: Center(
+                              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                                Icon(Icons.restore_rounded, size: 22),
+                                SizedBox(width: 8),
+                                Text('استرجاع الملفات اللي اتنقلت', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w800)),
+                              ]),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 14),
                         Container(
                           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
                           decoration: BoxDecoration(color: Colors.white.withAlpha(20), borderRadius: BorderRadius.circular(20), border: Border.all(color: Colors.white.withAlpha(30))),
@@ -361,11 +551,11 @@ jobs:
                             value: auto,
                             onChanged: busy ? null : setAuto,
                             activeColor: const Color(0xFF35D6A5),
-                            title: const Text('ترتيب تلقائي', style: TextStyle(fontWeight: FontWeight.w800)),
-                            subtitle: Text('يرتب الملفات الجديدة لوحده كل 15 دقيقة', style: TextStyle(fontSize: 12, color: Colors.white.withAlpha(150))),
+                            title: const Text('نسخ تلقائي', style: TextStyle(fontWeight: FontWeight.w800)),
+                            subtitle: Text('ينسخ الملفات الجديدة لوحده كل 15 دقيقة', style: TextStyle(fontSize: 12, color: Colors.white.withAlpha(150))),
                           ),
                         ),
-                        const SizedBox(height: 22),
+                        const SizedBox(height: 16),
                         Expanded(
                           child: GridView.count(
                             crossAxisCount: 2,
@@ -397,7 +587,7 @@ jobs:
                           ),
                         ),
                         if (lastMoves.isNotEmpty && !busy)
-                          Center(child: TextButton.icon(onPressed: undo, icon: const Icon(Icons.undo_rounded), label: const Text('تراجع عن آخر ترتيب'))),
+                          Center(child: TextButton.icon(onPressed: undo, icon: const Icon(Icons.undo_rounded), label: const Text('تراجع: امسح نسخ آخر عملية'))),
                       ]),
                     ),
                   ),
@@ -528,13 +718,14 @@ jobs:
           }
           MAIN_EOF
       - name: Create Android project
-        run: flutter create --platforms=android --project-name file_organizer .
-      - name: Add storage permissions
+        run: flutter create --platforms=android --org ${{ matrix.org }} --project-name file_organizer .
+      - name: Add permissions and app name
         run: |
           sed -i '/<manifest/a <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/><uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>' android/app/src/main/AndroidManifest.xml
+          sed -i 's|android:label="file_organizer"|android:label="${{ matrix.label }}"|' android/app/src/main/AndroidManifest.xml
       - run: flutter pub get
-      - run: flutter build apk --release
+      - run: flutter build apk --release --no-shrink --dart-define=FLAVOR=${{ matrix.flavor }}
       - uses: actions/upload-artifact@v4
         with:
-          name: file-organizer-v4-apk
+          name: file-organizer-v6-${{ matrix.flavor }}-apk
           path: build/app/outputs/flutter-apk/app-release.apk
